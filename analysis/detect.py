@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from skimage.morphology import skeletonize
 
 from core.model import DotGrid, Stroke, Symmetry, Kolam
 
@@ -127,6 +128,139 @@ def detect_dots(binary_img: np.ndarray) -> DotGrid:
     )
 
 
+# --- Stroke tracing --------------------------------------------------------
+#
+# trace_strokes() is PRIMARY: it skeletonizes the stroke-only mask and walks
+# the resulting pixel graph into ordered per-stroke paths, closing strokes
+# that form loops. It correctly separates strokes that don't touch each
+# other, but a real crossing (two strokes overlapping at a pixel, 3+
+# skeleton neighbors) is not disambiguated -- the walk just stops there,
+# which fragments a stroke into pieces at that point. Curve bends can also
+# spuriously look like 3-way junctions under 8-connectivity; the graph
+# builder below prunes the redundant diagonal edge that usually causes that,
+# but it is not a full fix for real intersections.
+#
+# trace_strokes_simple() is the FALLBACK named in the task: if trace_strokes()
+# fragments too aggressively on a given image, this skips all endpoint/
+# junction reasoning and just returns each connected skeleton component as
+# one Stroke (points ordered left-to-right, not walked). It won't separate
+# strokes that touch, but it always produces *something* usable for
+# downstream symmetry/loop-count inference.
+
+_NEIGHBOR_OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+def _erase_dots(binary_img: np.ndarray, dot_grid: DotGrid) -> np.ndarray:
+    """Blank out the dot blobs so skeletonization only sees stroke lines."""
+    lines_only = binary_img.copy()
+    radius = max(5, int(dot_grid.spacing * 0.18)) if dot_grid.spacing else 8
+    for x, y in dot_grid.dots:
+        cv2.circle(lines_only, (int(round(x)), int(round(y))), radius, 0, -1)
+    return lines_only
+
+
+def _skeleton_graph(skeleton: np.ndarray) -> dict:
+    """8-connected adjacency dict over skeleton pixels, {(row, col): [(row, col), ...]}.
+
+    Drops a diagonal edge when both of the orthogonal neighbors that would
+    make it redundant are also present, so a smooth curved line doesn't
+    register a spurious degree-3 junction at every bend.
+    """
+    points = set(map(tuple, np.argwhere(skeleton)))
+    graph = {}
+    for r, c in points:
+        neighbors = []
+        for dr, dc in _NEIGHBOR_OFFSETS:
+            if dr != 0 and dc != 0 and (r + dr, c) in points and (r, c + dc) in points:
+                continue
+            if (r + dr, c + dc) in points:
+                neighbors.append((r + dr, c + dc))
+        graph[(r, c)] = neighbors
+    return graph
+
+
+def _walk_path(graph: dict, degree: dict, start: tuple, visited: set) -> list:
+    """Walk an open chain from an endpoint until another endpoint or a junction."""
+    path = [start]
+    visited.add(start)
+    current = start
+    while True:
+        neighbors = [n for n in graph[current] if n not in visited]
+        if not neighbors:
+            break
+        nxt = neighbors[0]
+        path.append(nxt)
+        if degree[nxt] >= 3:
+            break  # stop at a junction; leave it unvisited so other strokes can still reach it
+        visited.add(nxt)
+        current = nxt
+    return path
+
+
+def _walk_loop(graph: dict, start: tuple, visited: set) -> list:
+    """Walk a closed ring starting and ending at `start`."""
+    path = [start]
+    visited.add(start)
+    prev, current = None, start
+    while True:
+        neighbors = [n for n in graph[current] if n != prev]
+        nxt = start if start in neighbors else next((n for n in neighbors if n not in visited), None)
+        if nxt is None or nxt == start:
+            break
+        path.append(nxt)
+        visited.add(nxt)
+        prev, current = current, nxt
+    return path
+
+
+def trace_strokes(binary_img: np.ndarray, dot_grid: DotGrid) -> list:
+    """PRIMARY: trace ordered Stroke paths from the skeletonized stroke lines."""
+    lines_only = _erase_dots(binary_img, dot_grid)
+    skeleton = skeletonize(lines_only > 0)
+
+    graph = _skeleton_graph(skeleton)
+    degree = {p: len(n) for p, n in graph.items()}
+    visited = set()
+    strokes = []
+
+    endpoints = [p for p, d in degree.items() if d == 1]
+    for start in endpoints:
+        if start in visited:
+            continue
+        path = _walk_path(graph, degree, start, visited)
+        if len(path) >= 3:
+            strokes.append(Stroke(points=[(float(c), float(r)) for r, c in path], closed=False))
+
+    for start in graph:
+        if start in visited:
+            continue
+        path = _walk_loop(graph, start, visited)
+        if len(path) >= 3:
+            strokes.append(Stroke(points=[(float(c), float(r)) for r, c in path], closed=True))
+        else:
+            visited.add(start)
+
+    return strokes
+
+
+def trace_strokes_simple(binary_img: np.ndarray, dot_grid: DotGrid) -> list:
+    """FALLBACK: one Stroke per connected skeleton component, no path walking."""
+    lines_only = _erase_dots(binary_img, dot_grid)
+    skeleton = skeletonize(lines_only > 0)
+
+    num_labels, labels = cv2.connectedComponents(skeleton.astype(np.uint8), connectivity=8)
+
+    strokes = []
+    for label in range(1, num_labels):
+        ys, xs = np.where(labels == label)
+        if len(xs) < 3:
+            continue
+        points = sorted(zip(xs.tolist(), ys.tolist()))
+        strokes.append(Stroke(points=[(float(x), float(y)) for x, y in points], closed=False))
+
+    return strokes
+
+
 def _make_synthetic_kolam(path: str, rows: int = 5, cols: int = 5, spacing: int = 60, margin: int = 60) -> None:
     """Generate a clean black-on-white test kolam: a dot grid plus decorative strokes."""
     h = margin * 2 + spacing * (rows - 1)
@@ -154,6 +288,54 @@ def _visualize(binary_img: np.ndarray, grid: DotGrid, out_path: str) -> None:
     cv2.imwrite(out_path, overlay)
 
 
+def _make_stroke_test_image(path: str, rows: int = 5, cols: int = 5, spacing: int = 60, canvas: int = 500) -> None:
+    """Clean test kolam with one closed wavy loop and one open wavy stroke,
+    on the same dot grid style as _make_synthetic_kolam, so both closed=True
+    and closed=False get exercised.
+    """
+    img = np.full((canvas, canvas), 255, dtype=np.uint8)
+    center = canvas // 2
+    margin = center - (cols - 1) * spacing // 2
+
+    dots = [(margin + c * spacing, margin + r * spacing) for r in range(rows) for c in range(cols)]
+    for x, y in dots:
+        cv2.circle(img, (x, y), 8, 0, -1)
+
+    # closed loop: wavy ring fully outside the dot grid's convex hull
+    loop_pts = []
+    for deg in range(361):
+        theta = np.radians(deg)
+        r = 210 + 20 * np.sin(6 * theta)
+        loop_pts.append((int(round(center + r * np.cos(theta))), int(round(center + r * np.sin(theta)))))
+    cv2.polylines(img, [np.array(loop_pts, dtype=np.int32)], isClosed=True, color=0, thickness=3)
+
+    # open stroke: wavy line through the middle dot row, dipping between dots without touching them
+    mid_y = margin + (rows // 2) * spacing
+    x0, x1 = margin, margin + (cols - 1) * spacing
+    open_pts = [
+        (x, int(round(mid_y + 25 * np.cos((x - margin) / spacing * np.pi))))
+        for x in range(x0, x1 + 1)
+    ]
+    cv2.polylines(img, [np.array(open_pts, dtype=np.int32)], isClosed=False, color=0, thickness=3)
+
+    cv2.imwrite(path, img)
+
+
+_STROKE_PALETTE = [(0, 0, 255), (255, 0, 0), (0, 160, 0), (255, 140, 0), (200, 0, 200), (0, 180, 180)]
+
+
+def _visualize_strokes(binary_img: np.ndarray, dot_grid: DotGrid, strokes: list, out_path: str) -> None:
+    overlay = cv2.cvtColor(255 - binary_img, cv2.COLOR_GRAY2BGR)
+    for x, y in dot_grid.dots:
+        cv2.circle(overlay, (int(round(x)), int(round(y))), 4, (0, 0, 0), -1)
+    for i, stroke in enumerate(strokes):
+        color = _STROKE_PALETTE[i % len(_STROKE_PALETTE)]
+        pts = np.array([(int(round(x)), int(round(y))) for x, y in stroke.points], dtype=np.int32)
+        cv2.polylines(overlay, [pts], isClosed=stroke.closed, color=color, thickness=2)
+        cv2.circle(overlay, tuple(pts[0]), 5, color, -1)
+    cv2.imwrite(out_path, overlay)
+
+
 if __name__ == "__main__":
     test_dir = Path("data")
     test_dir.mkdir(exist_ok=True)
@@ -173,3 +355,23 @@ if __name__ == "__main__":
 
     _visualize(binary, grid, str(out_path))
     print(f"Overlay saved to {out_path}")
+
+    # --- stroke tracing (needs an image with an actual loop, unlike the straight
+    # decorative bands above, so it gets its own dedicated fixture) ---
+    stroke_test_path = test_dir / "sample_kolam_strokes.png"
+    stroke_out_path = test_dir / "sample_kolam_strokes_detected.png"
+    _make_stroke_test_image(str(stroke_test_path))
+
+    stroke_binary = load_and_preprocess(str(stroke_test_path))
+    stroke_grid = detect_dots(stroke_binary)
+
+    strokes = trace_strokes(stroke_binary, stroke_grid)
+    closed_n = sum(s.closed for s in strokes)
+    print(f"\n[trace_strokes] {len(strokes)} strokes ({closed_n} closed, {len(strokes) - closed_n} open)")
+    for i, s in enumerate(strokes):
+        print(f"  stroke {i}: {len(s.points)} pts, closed={s.closed}")
+    _visualize_strokes(stroke_binary, stroke_grid, strokes, str(stroke_out_path))
+    print(f"Stroke overlay saved to {stroke_out_path}")
+
+    simple_strokes = trace_strokes_simple(stroke_binary, stroke_grid)
+    print(f"[trace_strokes_simple fallback] {len(simple_strokes)} skeleton components")

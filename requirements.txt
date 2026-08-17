@@ -1,6 +1,7 @@
 numpy
 opencv-python
 scipy
+scikit-image
 matplotlib
 svgwrite
 fastapi
