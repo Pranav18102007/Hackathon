@@ -7,3 +7,4 @@ svgwrite
 fastapi
 uvicorn[standard]
 python-multipart
+scikit-image
