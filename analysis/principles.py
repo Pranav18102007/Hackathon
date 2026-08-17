@@ -7,14 +7,27 @@ from core.symmetry import detect_symmetry, count_loops
 from analysis import detect
 
 
-def analyze(path: str) -> Kolam:
+def analyze(path: str, debug: bool = False) -> Kolam:
     """Run the detect -> trace -> symmetry/loop pipeline and assemble a full Kolam."""
+    if debug:
+        print(f"[analyze] loading {path}")
     binary = detect.load_and_preprocess(path)
-    grid = detect.detect_dots(binary)
-    strokes = detect.trace_strokes(binary, grid)
+
+    if debug:
+        print("[analyze] -> detect_dots")
+    grid = detect.detect_dots(binary, debug=debug)
+
+    if debug:
+        print("[analyze] -> trace_strokes")
+    strokes = detect.trace_strokes(binary, grid, debug=debug)
 
     symmetry = detect_symmetry(strokes, grid)
     loop_count, single_loop = count_loops(strokes)
+
+    if debug:
+        print(f"[analyze] detect_symmetry -> rotational=C{symmetry.rotational}, "
+              f"mirror_axes={symmetry.mirror_axes}")
+        print(f"[analyze] count_loops -> loop_count={loop_count}, single_loop={single_loop}")
 
     principles = {
         "grid_size": f"{grid.rows}x{grid.cols}",
@@ -27,15 +40,21 @@ def analyze(path: str) -> Kolam:
         "stroke_count": len(strokes),
     }
 
+    # sikku kolams are traditionally drawn as one unbroken thread; that's
+    # exactly what single_loop tests for, so it's a reasonable style guess.
+    # This is the ONLY place style is ever set on the returned Kolam.
+    style = "sikku" if single_loop else "pulli"
+    if debug:
+        print(f"[analyze] style: single_loop={single_loop} -> style='{style}' "
+              f"(only set here, from single_loop, nowhere else)")
+
     return Kolam(
         grid=grid,
         strokes=strokes,
         symmetry=symmetry,
         loop_count=loop_count,
         single_loop=single_loop,
-        # sikku kolams are traditionally drawn as one unbroken thread; that's
-        # exactly what single_loop tests for, so it's a reasonable style guess.
-        style="sikku" if single_loop else "pulli",
+        style=style,
         principles=principles,
     )
 

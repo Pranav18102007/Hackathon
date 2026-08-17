@@ -53,9 +53,11 @@ def _cluster_1d(values: list) -> list:
     return [float(np.mean(c)) for c in clusters]
 
 
-def _estimate_spacing(centroids: list) -> float:
+def _estimate_spacing(centroids: list, debug: bool = False) -> float:
     """Median nearest-neighbor distance between dots."""
     if len(centroids) < 2:
+        if debug:
+            print(f"    [_estimate_spacing] only {len(centroids)} centroid(s) -> spacing=0.0")
         return 0.0
     pts = np.array(centroids)
     dists = []
@@ -63,6 +65,9 @@ def _estimate_spacing(centroids: list) -> float:
         d = np.linalg.norm(pts - p, axis=1)
         d[i] = np.inf
         dists.append(d.min())
+    if debug:
+        print(f"    [_estimate_spacing] nearest-neighbor dists (first 5 of {len(dists)}): {dists[:5]}")
+        print(f"    [_estimate_spacing] median -> spacing = {float(np.median(dists))}")
     return float(np.median(dists))
 
 
@@ -91,33 +96,61 @@ def _infer_layout(row_centers: list, centroids: list, spacing: float) -> str:
     return "rhombus"
 
 
-def detect_dots(binary_img: np.ndarray) -> DotGrid:
+def detect_dots(binary_img: np.ndarray, debug: bool = False) -> DotGrid:
     """Find the pulli dot grid via contour/blob detection and infer its geometry."""
     contours, _ = cv2.findContours(binary_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if debug:
+        print(f"  [detect_dots] {len(contours)} raw contours found (RETR_LIST)")
 
     centroids = []
+    rejected_area, rejected_circularity, rejected_fill = 0, 0, 0
     for c in contours:
         area = cv2.contourArea(c)
         if area < 10:
+            rejected_area += 1
             continue
         perimeter = cv2.arcLength(c, True)
         if perimeter == 0:
             continue
         circularity = 4 * np.pi * area / (perimeter ** 2)
         if circularity < 0.7:
+            rejected_circularity += 1
+            continue
+        # A filled dot occupies most of its bounding box; a hollow stroke
+        # outline (e.g. a diamond loop) is convex enough to pass circularity
+        # too, but only covers a fraction of its bbox -- reject those.
+        _, _, bw, bh = cv2.boundingRect(c)
+        bbox_area = bw * bh
+        fill_ratio = area / bbox_area if bbox_area else 0.0
+        if fill_ratio < 0.65:
+            rejected_fill += 1
             continue
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
         centroids.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
 
+    if debug:
+        print(f"  [detect_dots] rejected: {rejected_area} area<10, {rejected_circularity} circularity<0.7, "
+              f"{rejected_fill} fill_ratio<0.65")
+        print(f"  [detect_dots] {len(centroids)} centroids passed the filters")
+        print(f"  [detect_dots] first 5 centroids: {centroids[:5]}")
+
     if not centroids:
+        if debug:
+            print("  [detect_dots] no centroids at all -> returning rows=0 cols=0 spacing=0.0")
         return DotGrid(rows=0, cols=0, spacing=0.0, layout="square", dots=[])
 
     row_centers = _cluster_1d([y for _, y in centroids])
     col_centers = _cluster_1d([x for x, _ in centroids])
-    spacing = _estimate_spacing(centroids)
+    spacing = _estimate_spacing(centroids, debug=debug)
     layout = _infer_layout(row_centers, centroids, spacing)
+
+    if debug:
+        print(f"  [detect_dots] row_centers ({len(row_centers)}): {row_centers}")
+        print(f"  [detect_dots] col_centers ({len(col_centers)}): {col_centers}")
+        print(f"  [detect_dots] -> DotGrid(rows={len(row_centers)}, cols={len(col_centers)}, "
+              f"spacing={spacing}, layout={layout})")
 
     return DotGrid(
         rows=len(row_centers),
@@ -213,10 +246,26 @@ def _walk_loop(graph: dict, start: tuple, visited: set) -> list:
     return path
 
 
-def trace_strokes(binary_img: np.ndarray, dot_grid: DotGrid) -> list:
-    """PRIMARY: trace ordered Stroke paths from the skeletonized stroke lines."""
+def trace_strokes(binary_img: np.ndarray, dot_grid: DotGrid, debug: bool = False) -> list:
+    """PRIMARY: trace ordered Stroke paths from the skeletonized stroke lines.
+
+    Note for debug=True: this tracer never calls cv2.findContours -- it walks
+    a skeleton pixel graph instead, so there's no literal "inner vs outer
+    contour" step to double-count. The debug prints below show the
+    skeleton-graph equivalent (node/endpoint/junction counts and how many
+    strokes each walking phase produces) so a similar over/under-counting bug
+    can still be pinpointed to a specific phase.
+    """
     lines_only = _erase_dots(binary_img, dot_grid)
+    if debug:
+        print(f"  [trace_strokes] dot_grid.dots={len(dot_grid.dots)}, dot_grid.spacing={dot_grid.spacing} "
+              f"-> erase radius={max(5, int(dot_grid.spacing * 0.18)) if dot_grid.spacing else 8}")
+        print(f"  [trace_strokes] ink pixels before dot erasure: {int(np.count_nonzero(binary_img))}, "
+              f"after: {int(np.count_nonzero(lines_only))}")
+
     skeleton = skeletonize(lines_only > 0)
+    if debug:
+        print(f"  [trace_strokes] skeleton pixel count: {int(skeleton.sum())}")
 
     graph = _skeleton_graph(skeleton)
     degree = {p: len(n) for p, n in graph.items()}
@@ -224,12 +273,20 @@ def trace_strokes(binary_img: np.ndarray, dot_grid: DotGrid) -> list:
     strokes = []
 
     endpoints = [p for p, d in degree.items() if d == 1]
+    junctions = [p for p, d in degree.items() if d >= 3]
+    if debug:
+        print(f"  [trace_strokes] graph nodes: {len(graph)}, endpoints (degree=1): {len(endpoints)}, "
+              f"junctions (degree>=3): {len(junctions)}")
+
     for start in endpoints:
         if start in visited:
             continue
         path = _walk_path(graph, degree, start, visited)
         if len(path) >= 3:
             strokes.append(Stroke(points=[(float(c), float(r)) for r, c in path], closed=False))
+
+    if debug:
+        print(f"  [trace_strokes] strokes after endpoint-walk phase (raw, before loop scan): {len(strokes)}")
 
     for start in graph:
         if start in visited:
@@ -239,6 +296,11 @@ def trace_strokes(binary_img: np.ndarray, dot_grid: DotGrid) -> list:
             strokes.append(Stroke(points=[(float(c), float(r)) for r, c in path], closed=True))
         else:
             visited.add(start)
+
+    if debug:
+        closed_n = sum(s.closed for s in strokes)
+        print(f"  [trace_strokes] final strokes: {len(strokes)} ({closed_n} closed, {len(strokes) - closed_n} open) "
+              f"-- no dedup step exists in this implementation")
 
     return strokes
 
