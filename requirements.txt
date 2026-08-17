@@ -1,0 +1,8 @@
+numpy
+opencv-python
+scipy
+matplotlib
+svgwrite
+fastapi
+uvicorn[standard]
+python-multipart
